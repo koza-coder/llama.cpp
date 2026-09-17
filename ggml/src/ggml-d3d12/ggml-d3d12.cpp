@@ -221,6 +221,7 @@ struct d3d12_device_ctx {
     bool     no_barrier       = false; // GGML_D3D12_NO_BARRIER: measurement only, results are wrong
     bool     no_fuse          = false; // GGML_D3D12_NO_FUSE: encode every node on its own, for bisecting
     uint32_t mm_tpr_max       = D3D12_WG_SIZE; // GGML_D3D12_MM_TPR: cap on matvec threads per row (1 = no reduction tree)
+    uint32_t tiled_min_cols   = 0;   // GGML_D3D12_TILED: columns from which the tiled prompt kernel is used (0 = never)
     std::string disable_ops;           // GGML_D3D12_DISABLE_OPS: comma separated op names sent to the CPU
     std::mutex  rejected_mutex;
     std::map<std::string, uint64_t> rejected;   // with stats: "op src types -> type" refused by supports_op
@@ -927,10 +928,79 @@ struct d3d12_mat_slot {
     ggml_tensor * add;   // addend of the fused ADD, or null
 };
 
+// types the tiled prompt kernel dequantizes (mul_mat_tiled.hlsl)
+static bool ggml_d3d12_tiled_type(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Is this product worth the tiled kernel, and can that kernel express it? Long prompts only: for a
+// handful of columns the matvec kernel wins, because a tile of 32 columns would be mostly padding.
+static bool ggml_d3d12_use_tiled(const d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                                 ggml_tensor * dst) {
+    return dev.tiled_min_cols != 0 && (uint32_t) dst->ne[1] >= dev.tiled_min_cols &&
+           ggml_d3d12_tiled_type(src0->type) && src0->ne[0] % 32 == 0 &&
+           (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
+}
+
+// dst = src0 * src1 with a TILE_M x TILE_N tile of dst per workgroup; see mul_mat_tiled.hlsl
+static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                                     ggml_tensor * dst) {
+    std::string define = "SRC0_";
+    define += ggml_type_name(src0->type);
+    for (auto & ch : define) {
+        ch = (char) toupper((unsigned char) ch);
+    }
+    std::vector<std::string> defines = { define };
+    if (src1->type == GGML_TYPE_F16) {
+        defines.push_back("SRC1_F16");
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
+
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const size_t        t0 = ggml_type_size(src0->type);
+    const size_t        t1 = ggml_type_size(src1->type);
+
+    const uint32_t broadcast2 = (uint32_t) (src1->ne[2] / src0->ne[2]);
+    const uint32_t broadcast3 = (uint32_t) (src1->ne[3] / src0->ne[3]);
+
+    std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) src0->ne[0],
+        (uint32_t) (src0->nb[1] / t0), (uint32_t) (src0->nb[2] / t0), (uint32_t) (src0->nb[3] / t0),
+        (uint32_t) (src1->nb[1] / t1), (uint32_t) (src1->nb[2] / t1), (uint32_t) (src1->nb[3] / t1),
+        (uint32_t) dst->ne[2], broadcast2, broadcast3,
+        (uint32_t) (dst->ne[2] * dst->ne[3]),
+    };
+
+    // tile sizes must match TILE_M and TILE_N in mul_mat_tiled.hlsl
+    const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], 64u);
+    const uint32_t tiles_n  = CEIL_DIV((uint32_t) dst->ne[1], 32u);
+    const uint32_t batches  = (uint32_t) (dst->ne[2] * dst->ne[3]);
+    ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va }, tiles_m * tiles_n * batches);
+}
+
 // up to 3 matrices sharing src1 in one dispatch; every matrix owns a range of workgroups
 static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1, const std::vector<d3d12_mat_slot> & mats) {
     GGML_ASSERT(!mats.empty() && mats.size() <= 3);
     ggml_tensor * src0 = mats[0].src0;
+    // a single unfused product with many columns goes to the tiled kernel instead
+    if (mats.size() == 1 && mats[0].add == nullptr &&
+        ggml_d3d12_use_tiled(dev, src0, src1, mats[0].dst)) {
+        ggml_d3d12_mul_mat_tiled(dev, src0, src1, mats[0].dst);
+        return;
+    }
     std::string define = "SRC0_";
     define += ggml_type_name(src0->type);
     for (auto & ch : define) {
@@ -2562,6 +2632,10 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
     }
     if (const char * env = getenv("GGML_D3D12_MM_TPR")) {
         dev.mm_tpr_max = (uint32_t) std::max(1, atoi(env));
+    }
+    if (const char * env = getenv("GGML_D3D12_TILED")) {
+        // column count from which the tiled prompt kernel takes over; 1 means "always when eligible"
+        dev.tiled_min_cols = (uint32_t) std::max(0, atoi(env));
     }
     if (const char * env = getenv("GGML_D3D12_DISABLE_OPS")) {
         dev.disable_ops = std::string(",") + env + ",";

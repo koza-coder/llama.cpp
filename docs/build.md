@@ -845,6 +845,7 @@ Environment variables:
 - `GGML_D3D12_NO_FUSE=1`: encode every graph node on its own instead of fusing (rms_norm with mul, matrix groups sharing one input)
 - `GGML_D3D12_NO_SHADER_CACHE=1`: always compile the kernels instead of reading the `d3d12-shader-cache` folder next to the backend DLL
 - `GGML_D3D12_MM_TPR=32`: cap on the threads that share one matrix row in the matrix-vector kernel (1 disables the reduction tree)
+- `GGML_D3D12_TILED=32`: use the tiled matrix multiplication kernel for products with at least this many columns (0, the default, never uses it); 32 covers prompt processing and leaves token generation on the matrix-vector kernel
 
 ### Cross-compiling from Linux
 
