@@ -821,6 +821,44 @@ WebGPU allows cross-platform access to the GPU from supported browsers. We utili
 
 Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/src/emdawnwebgpu/) to download or build the emdawnwebgpu package (Note that it might be safer to build the emdawnwebgpu package locally, so that it stays in sync with the version of Dawn you have installed above). When building using CMake, the path to the emdawnwebgpu port file needs to be set with the flag `EMDAWNWEBGPU_DIR`.
 
+## D3D12
+
+The Direct3D 12 backend runs on any Windows 10 (1909+) or Windows 11 GPU with shader model 6.0. Kernels are HLSL, embedded as source and compiled at runtime with the DirectX Shader Compiler, so the build needs no shader toolchain.
+
+```
+cmake -B build -DGGML_D3D12=ON
+cmake --build build --config Release
+```
+
+At runtime, copy `dxcompiler.dll` and `dxil.dll` from a [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases) next to the executables. Without `dxil.dll` the shaders are unsigned and most drivers reject them.
+
+Environment variables:
+- `GGML_D3D12_DEBUG=1`: enable the D3D12 debug layer (needs the Windows "Graphics Tools" optional feature)
+- `GGML_D3D12_WARP=1`: also enumerate software (WARP) adapters
+- `GGML_D3D12_SM=60`: cap the shader model used for kernels (60 to 67), useful to test the fallback paths
+- `GGML_D3D12_MAX_ALLOC_MB=2048`: maximum size of a single device buffer
+- `GGML_D3D12_STATS=1`: print dispatch, submit and transfer counters at process exit
+- `GGML_D3D12_PROFILE=1`: also record GPU timestamps around every dispatch and print time per pipeline at exit
+- `GGML_D3D12_SUBMIT_BATCH=64`: dispatches per command list; smaller values keep each submission short on drivers that do not recover from a GPU timeout
+- `GGML_D3D12_DISABLE=1`: expose no D3D12 devices, so everything falls back to the CPU backend
+- `GGML_D3D12_DISABLE_OPS=MUL_MAT.ROPE`: send these ops to another backend (names separated by `.`, `ALL` for every op); with `GGML_D3D12_STATS` the ops refused by the backend are printed too
+- `GGML_D3D12_NO_FUSE=1`: encode every graph node on its own instead of fusing (rms_norm with mul, matrix groups sharing one input)
+- `GGML_D3D12_NO_SHADER_CACHE=1`: always compile the kernels instead of reading the `d3d12-shader-cache` folder next to the backend DLL
+- `GGML_D3D12_MM_TPR=32`: cap on the threads that share one matrix row in the matrix-vector kernel (1 disables the reduction tree)
+
+### Cross-compiling from Linux
+
+With the mingw-w64 GCC toolchain installed (`g++-mingw-w64-x86-64-posix` on Debian), the D3D12, DXGI and DXC headers are already present:
+
+```
+cmake -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/x86_64-w64-mingw32.cmake \
+    -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
+    -DGGML_D3D12=ON -DLLAMA_OPENSSL=OFF
+cmake --build build-win --config Release
+```
+
+Copy `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libgomp-1.dll` and `libwinpthread-1.dll` from the mingw-w64 installation into `build-win/bin` together with the DXC DLLs. `dxcompiler.dll` is an MSVC build and needs the Visual C++ 2015-2022 redistributable on the target machine.
+
 ## IBM Z & LinuxONE
 
 To read documentation for how to build on IBM Z & LinuxONE, [click here](./build-s390x.md)

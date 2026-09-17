@@ -9853,6 +9853,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // reduction lengths taken from real models (Qwen2.5-0.5B 896/4864, Gemma-3-12B 3840/15360): every
+    // other supported mul_mat case here uses k=256, which hides bugs in wide reductions
+    for (int64_t k : { 896, 3840, 4864, 15360 }) {
+        for (ggml_type ta : { GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+            if (k % ggml_blck_size(ta) != 0) {
+                continue;
+            }
+            for (int n : { 1, 4 }) {
+                test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 1024, n, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+    // KV cache shaped set_rows: a wide row written into a tall destination
+    for (int64_t row : { 1024, 2048 }) {
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { row, 8192, 1, 1 }, { 1, 1 }, 4, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { row, 8192, 1, 1 }, { 1, 1 }, 4, true));
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));

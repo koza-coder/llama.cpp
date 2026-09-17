@@ -73,6 +73,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [BLIS](docs/backend/BLIS.md) | All |
 | [CANN](docs/build.md#cann) | Ascend NPU |
 | [CUDA](docs/build.md#cuda) | Nvidia GPU |
+| [D3D12](docs/build.md#d3d12) | Windows GPU |
 | [HIP](docs/build.md#hip) | AMD GPU |
 | [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
 | [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |

@@ -50,6 +50,10 @@
 #include "ggml-webgpu.h"
 #endif
 
+#ifdef GGML_USE_D3D12
+#include "ggml-d3d12.h"
+#endif
+
 #ifdef GGML_USE_ZDNN
 #include "ggml-zdnn.h"
 #endif
@@ -136,6 +140,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_WEBGPU
         register_backend(ggml_backend_webgpu_reg());
+#endif
+#ifdef GGML_USE_D3D12
+        register_backend(ggml_backend_d3d12_reg());
 #endif
 #ifdef GGML_USE_ZDNN
         register_backend(ggml_backend_zdnn_reg());
@@ -591,6 +598,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("rpc", silent, dir_path);
     ggml_backend_load_best("sycl", silent, dir_path);
     ggml_backend_load_best("vulkan", silent, dir_path);
+    ggml_backend_load_best("d3d12", silent, dir_path);
     ggml_backend_load_best("virtgpu", silent, dir_path);
     ggml_backend_load_best("opencl", silent, dir_path);
     ggml_backend_load_best("hexagon", silent, dir_path);
