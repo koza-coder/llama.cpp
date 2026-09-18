@@ -17,17 +17,17 @@ window. `curl` and `tar` are part of Windows 10 and 11, so nothing else has to b
 Download the zip from the releases page and unpack it:
 
 ```
-curl -L -o llama-d3d12.zip https://github.com/koza-coder/llama.cpp/releases/download/d3d12-v0.1.0/llama-d3d12-d3d12-v0.1.0-win-x64.zip
+curl -L -o llama-d3d12.zip https://github.com/koza-coder/llama.cpp/releases/download/d3d12-v0.1.1/llama-d3d12-d3d12-v0.1.1-win-x64.zip
 ```
 
 ```
 tar -xf llama-d3d12.zip
 ```
 
-That creates a folder `llama-d3d12-d3d12-v0.1.0-win-x64`. Go into it:
+That creates a folder `llama-d3d12-d3d12-v0.1.1-win-x64`. Go into it:
 
 ```
-cd llama-d3d12-d3d12-v0.1.0-win-x64
+cd llama-d3d12-d3d12-v0.1.1-win-x64
 ```
 
 Check you got the file intact before running it - the number must match exactly:
@@ -37,19 +37,20 @@ certutil -hashfile ..\llama-d3d12.zip SHA256
 ```
 
 ```
-b3aba7f098939a5208ce7af82c9eb54360be5907b843f991a2ce13c656e09eed
+da30a0c1c5ba16a9fbbc148bbc2e93ba9ac939875d4dc51ce6f96f6b47df86a0
 ```
 
-Inside you will find three programs and two DLLs:
+Inside you will find four programs and two DLLs:
 
 | file | what it is |
 |---|---|
 | `llama-cli.exe` | chat with a model |
 | `llama-bench.exe` | measure speed |
 | `test-backend-ops.exe` | check the GPU produces correct results |
+| `llama-mtmd-cli.exe` | describe a picture or transcribe speech |
 | `dxcompiler.dll`, `dxil.dll` | **required** - the backend compiles its shaders with these at startup |
 
-Keep all five files together. The programs are otherwise self-contained: no runtime to install,
+Keep all six files together. The programs are otherwise self-contained: no runtime to install,
 no other DLLs, nothing added to your system.
 
 ---
@@ -126,7 +127,7 @@ llama-bench.exe -m model.gguf -ngl 99
 Two numbers come out. `pp512` is prompt processing, how fast it reads your input. `tg128` is text
 generation, how fast it writes the answer. Both are tokens per second, higher is better.
 
-To see what the difference the GPU makes, run it again with `-ngl 0` and compare.
+To see what difference the GPU makes, run it again with `-ngl 0` and compare.
 
 ---
 
@@ -168,14 +169,53 @@ test-backend-ops.exe test -b D3D120 -o MUL_MAT
 
 ## 7. Pictures and sound
 
-The backend also runs multimodal models. This needs two files, the model and its "mmproj"
-projector, and the `llama-mtmd-cli.exe` program which is **not** in this zip - you would have to
-build it from source. Listed here so you know the capability exists:
+`llama-mtmd-cli.exe` runs multimodal models. These need **two** files: the model itself and a
+matching "mmproj" projector that turns a picture or a sound into something the model understands.
+Both come from the same Hugging Face repository, and they must be a matching pair.
 
-| use | model | size |
-|---|---|---|
-| describe a picture | `ggml-org/SmolVLM-500M-Instruct-GGUF` | 437 MB + 109 MB projector |
-| transcribe speech | `ggml-org/Qwen3-ASR-0.6B-GGUF` | 805 MB + 214 MB projector |
+### Describe a picture
+
+```
+curl -L -o vision.gguf https://huggingface.co/ggml-org/SmolVLM-500M-Instruct-GGUF/resolve/main/SmolVLM-500M-Instruct-Q8_0.gguf
+```
+
+```
+curl -L -o vision-mmproj.gguf https://huggingface.co/ggml-org/SmolVLM-500M-Instruct-GGUF/resolve/main/mmproj-SmolVLM-500M-Instruct-Q8_0.gguf
+```
+
+```
+llama-mtmd-cli.exe -m vision.gguf --mmproj vision-mmproj.gguf --image picture.jpg -ngl 99 -p "Describe this picture."
+```
+
+`.jpg` and `.png` both work.
+
+### Transcribe speech
+
+```
+curl -L -o asr.gguf https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf
+```
+
+```
+curl -L -o asr-mmproj.gguf https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf
+```
+
+```
+llama-mtmd-cli.exe -m asr.gguf --mmproj asr-mmproj.gguf --audio speech.mp3 -ngl 99 -p "Transcribe this audio."
+```
+
+`.mp3`, `.wav` and `.flac` all work. `--image` and `--audio` are in fact the same option, so
+either name accepts either kind of file.
+
+| file | bytes | SHA-256 |
+|---|---:|---|
+| `SmolVLM-500M-Instruct-Q8_0.gguf` | 436806912 | `9d4612de6a42214499e301494a3ecc2be0abdd9de44e663bda63f1152fad1bf4` |
+| `mmproj-SmolVLM-500M-Instruct-Q8_0.gguf` | 108783360 | `d1eb8b6b23979205fdf63703ed10f788131a3f812c7b1f72e0119d5d81295150` |
+| `Qwen3-ASR-0.6B-Q8_0.gguf` | 804749248 | `bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971` |
+| `mmproj-Qwen3-ASR-0.6B-Q8_0.gguf` | 214392480 | `41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d` |
+
+Speech recognition has been run on one GPU only so far, and 21 matrix operations in the audio
+encoder are not yet implemented in this backend, so they fall back to the processor. It works,
+but it is slower than it should be. `GGML_D3D12_STATS=1` lists exactly which operations fell back.
 
 ---
 
