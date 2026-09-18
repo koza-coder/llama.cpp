@@ -62,11 +62,17 @@ uint f32_to_f16_rne(float f) {
 #endif
 
 // unaligned raw loads (ByteAddressBuffer.Load ignores the low 2 address bits)
+// The high half used to be shifted by (32 - _s), which is a shift by 32 when the address happens
+// to be 4-byte aligned. A shift of 32 is undefined, and because the ternary around it is a select
+// rather than a branch both arms get evaluated, so a driver free to assume it cannot happen may
+// fold the whole expression wrongly. This showed up as wrong iq2_xxs and iq3_xxs scales on two
+// different GPUs. Keep every shift below 32 and drop the high half with a mask instead.
 #define LOAD_U32_UNALIGNED(buf, addr, out) { \
     const uint _a0 = (addr) & ~3u; \
     const uint _s  = ((addr) & 3u) * 8u; \
     const uint _lo = (buf).Load(_a0); \
-    out = _s == 0 ? _lo : ((_lo >> _s) | ((buf).Load(_a0 + 4) << (32u - _s))); \
+    const uint _hi = (buf).Load(_a0 + 4); \
+    out = (_lo >> _s) | ((_hi << ((32u - _s) & 31u)) & (_s == 0u ? 0u : 0xFFFFFFFFu)); \
 }
 #define LOAD_U16_UNALIGNED(buf, addr, out) { \
     const uint _w = (buf).Load((addr) & ~3u); \

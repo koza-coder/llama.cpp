@@ -2230,7 +2230,15 @@ static ggml_backend_buffer_t ggml_backend_d3d12_buffer_type_alloc_buffer(ggml_ba
     std::lock_guard<std::recursive_mutex> lock(dev->mutex);
 
     const size_t alloc_size = std::max((size_t) D3D12_BINDING_ALIGNMENT,
-                                       (size + D3D12_BINDING_ALIGNMENT - 1) & ~((size_t) D3D12_BINDING_ALIGNMENT - 1));
+                                       (size + D3D12_BINDING_ALIGNMENT - 1) & ~((size_t) D3D12_BINDING_ALIGNMENT - 1))
+                              // One binding alignment of slack past the end. Quant blocks whose size is
+                              // not a multiple of 4 (iq4_nl and q4_0 are 18 bytes, q5_0 22, q5_1 24) end
+                              // mid-word, and ByteAddressBuffer.Load only reads 4-byte aligned words, so
+                              // reading the last block's tail necessarily touches a few bytes past it.
+                              // Root UAVs carry no size, so that read is unbounded rather than clamped:
+                              // the Radeon tolerates it, the MTT S80 faults and the device is removed.
+                              // Verified by removing this slack, which brings the fault straight back.
+                              + D3D12_BINDING_ALIGNMENT;
     D3D12_LOG_DEBUG("alloc_buffer(%zu bytes)\n", alloc_size);
 
     com_ptr<ID3D12Resource> res = ggml_d3d12_create_buffer(*dev, alloc_size, D3D12_HEAP_TYPE_DEFAULT, L"ggml_d3d12_tensor_buf");
