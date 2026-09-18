@@ -846,6 +846,7 @@ Environment variables:
 - `GGML_D3D12_NO_SHADER_CACHE=1`: always compile the kernels instead of reading the `d3d12-shader-cache` folder next to the backend DLL
 - `GGML_D3D12_MM_TPR=32`: cap on the threads that share one matrix row in the matrix-vector kernel (1 disables the reduction tree)
 - `GGML_D3D12_TILED=32`: use the tiled matrix multiplication kernel for products with at least this many columns (0, the default, never uses it); 32 covers prompt processing and leaves token generation on the matrix-vector kernel
+- `GGML_D3D12_DRED=1`: enable Device Removed Extended Data, so that a device removal reports the command list, how far it got and the name and parameters of the dispatch that was in flight, instead of only an HRESULT; off by default because the breadcrumbs cost time on every dispatch
 
 ### Cross-compiling from Linux
 

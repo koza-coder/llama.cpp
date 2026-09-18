@@ -1,6 +1,13 @@
 #include "common.hlsli"
 
-// defines: TYPE_F32 or TYPE_F16 (+USE_16BIT), FF_FUNC when frequency factors are present
+// defines: TYPE_F32 or TYPE_F16 (+USE_16BIT), FF_FUNC when frequency factors are present,
+// BACKWARD for ROPE_BACK, which is this same rotation with the sine negated
+
+#ifdef BACKWARD
+#define SIN_SIGN (-1.0f)
+#else
+#define SIN_SIGN (1.0f)
+#endif
 
 #if defined(TYPE_F16)
 #define LOAD(buf, i)     LOAD_F16(buf, i)
@@ -72,7 +79,7 @@ float2 rope_yarn(float theta_extrap, uint i) {
         theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
         mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
     }
-    return float2(cos(theta) * mscale, sin(theta) * mscale);
+    return float2(cos(theta) * mscale, SIN_SIGN * sin(theta) * mscale);
 }
 
 [numthreads(WG_SIZE, 1, 1)]

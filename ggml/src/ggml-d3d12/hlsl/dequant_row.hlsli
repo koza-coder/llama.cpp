@@ -375,6 +375,148 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif defined(SRC0_IQ2_XXS)
+    // super-block of 256 (66 bytes): f16 d, then 32 uint16 qs. Each sub-block of 32 reads two
+    // uint32: the first is four grid indices, the second carries the four 7-bit sign codes and,
+    // in its top nibble, the sub-block scale. Scale d * (0.5 + nibble) * 0.25.
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint base = (src0_base + blk) * 66;
+        uint dbits, a0, a1;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s, a0);
+        LOAD_U32_UNALIGNED(src0, base + 6 + 8 * s, a1);
+        const float db = f16tof32(dbits) * (0.5f + (float) (a1 >> 28)) * 0.25f;
+        [unroll] for (uint l = 0; l < 4; l++) {
+            const uint gi = byte_of(a0, l);
+            const uint sg = KSIGNS[(a1 >> (7u * l)) & 127u];
+            [unroll] for (uint j = 0; j < 8; j++) {
+                const uint  gv  = j < 4 ? byte_of(IQ2XXS_GRID_LO[gi], j) : byte_of(IQ2XXS_GRID_HI[gi], j - 4);
+                const float sgn = ((sg >> j) & 1u) != 0 ? -1.0f : 1.0f;
+                ACC(db * (float) gv * sgn, blk * 256 + s * 32 + l * 8 + j);
+            }
+        }
+    }
+#elif defined(SRC0_IQ2_XS)
+    // super-block of 256 (74 bytes): f16 d, 32 uint16 qs, 8 scale bytes. Each qs entry is a
+    // 9-bit grid index plus a 7-bit sign code. The two nibbles of scales[s] scale the first and
+    // second half of the sub-block, as d * (0.5 + nibble) * 0.25.
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint base = (src0_base + blk) * 74;
+        uint dbits, sc;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 66 + s, sc);
+        const float d   = f16tof32(dbits);
+        const float db0 = d * (0.5f + (float) (sc & 0xFu)) * 0.25f;
+        const float db1 = d * (0.5f + (float) ((sc >> 4) & 0xFu)) * 0.25f;
+        [unroll] for (uint l = 0; l < 4; l++) {
+            uint q;
+            LOAD_U16_UNALIGNED(src0, base + 2 + 2 * (4 * s + l), q);
+            const uint  gi = q & 511u;
+            const uint  sg = KSIGNS[(q >> 9) & 127u];
+            const float dl = l < 2 ? db0 : db1;
+            [unroll] for (uint j = 0; j < 8; j++) {
+                const uint  gv  = j < 4 ? byte_of(IQ2XS_GRID_LO[gi], j) : byte_of(IQ2XS_GRID_HI[gi], j - 4);
+                const float sgn = ((sg >> j) & 1u) != 0 ? -1.0f : 1.0f;
+                ACC(dl * (float) gv * sgn, blk * 256 + s * 32 + l * 8 + j);
+            }
+        }
+    }
+#elif defined(SRC0_IQ3_XXS)
+    // super-block of 256 (98 bytes): f16 d, 64 grid-index bytes, then 32 bytes of packed scales
+    // and signs, one uint32 per sub-block. Each group l of 8 values takes two grid entries of
+    // 4 bytes each; the sign code is bits 7l..7l+6 of that uint32, the scale its top nibble,
+    // applied as d * (0.5 + nibble) * 0.5.
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint base = (src0_base + blk) * 98;
+        uint dbits, aux;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 66 + 4 * s, aux);
+        const float db = f16tof32(dbits) * (0.5f + (float) (aux >> 28)) * 0.5f;
+        [unroll] for (uint l = 0; l < 4; l++) {
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s + 2 * l, q);
+            const uint sg = KSIGNS[(aux >> (7u * l)) & 127u];
+            const uint g1 = IQ3XXS_GRID[q & 0xFFu];
+            const uint g2 = IQ3XXS_GRID[(q >> 8) & 0xFFu];
+            // one ACC per step, like the IQ3_S branch. Two ACCs in a half-width loop double what
+            // the unroller expands per step, and ACC is itself a loop over the columns, so this is
+            // the deepest unroll of any branch here.
+            [unroll] for (uint j = 0; j < 8; j++) {
+                const uint  gv  = j < 4 ? byte_of(g1, j) : byte_of(g2, j - 4);
+                const float sgn = ((sg >> j) & 1u) != 0 ? -1.0f : 1.0f;
+                ACC(db * (float) gv * sgn, blk * 256 + s * 32 + l * 8 + j);
+            }
+        }
+    }
+#elif defined(SRC0_IQ1_S)
+    // super-block of 256 (50 bytes): f16 d, 32 grid-index low bytes, 8 uint16 qh. Per sub-block
+    // qh holds the 3 high bits of each of the four grid indices, a 3-bit scale in bits 12..14 and
+    // the sign of the delta in bit 15. The codebook is signed bytes, and every value is shifted
+    // by +-IQ1S_DELTA (0.125) before scaling - there are no per-value sign bits here.
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint base = (src0_base + blk) * 50;
+        uint dbits, qh;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U16_UNALIGNED(src0, base + 34 + 2 * s, qh);
+        const float dl    = f16tof32(dbits) * (float) (2u * ((qh >> 12) & 7u) + 1u);
+        const float delta = (qh & 0x8000u) != 0 ? -0.125f : 0.125f;
+        [unroll] for (uint l = 0; l < 4; l++) {
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + 2 + 4 * s + l, q);
+            const uint gi = (q & 0xFFu) | (((qh >> (3u * l)) & 7u) << 8);
+            [unroll] for (uint j = 0; j < 8; j++) {
+                const int gv = j < 4 ? sbyte_of(IQ1S_GRID_LO[gi], j) : sbyte_of(IQ1S_GRID_HI[gi], j - 4);
+                ACC(dl * ((float) gv + delta), blk * 256 + s * 32 + l * 8 + j);
+            }
+        }
+    }
+#elif defined(SRC0_IQ1_M)
+    // super-block of 256 (56 bytes): 32 grid-index low bytes, 16 qh bytes, 8 scale bytes, and no
+    // separate d - the f16 scale is assembled from one nibble of each of the four scale uint16s.
+    // Each qh byte carries the 3 high index bits and the delta sign for two groups of 8, and each
+    // scale uint16 holds two 3-bit sub-block scales per half.
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint base = (src0_base + blk) * 56;
+        uint sc0, sc1, sc2, sc3;
+        LOAD_U16_UNALIGNED(src0, base + 48, sc0);
+        LOAD_U16_UNALIGNED(src0, base + 50, sc1);
+        LOAD_U16_UNALIGNED(src0, base + 52, sc2);
+        LOAD_U16_UNALIGNED(src0, base + 54, sc3);
+        const uint  sbits = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
+        const float d     = f16tof32(sbits);
+
+        const uint sc  = s < 2 ? sc0 : (s < 4 ? sc1 : (s < 6 ? sc2 : sc3));
+        const uint sh  = 6u * (s & 1u);
+        const float dl1 = d * (float) (2u * ((sc >> sh) & 7u) + 1u);
+        const float dl2 = d * (float) (2u * ((sc >> (sh + 3u)) & 7u) + 1u);
+
+        uint qh0, qh1;
+        LOAD_U32_UNALIGNED(src0, base + 32 + 2 * s, qh0);
+        qh1 = (qh0 >> 8) & 0xFFu;
+        qh0 = qh0 & 0xFFu;
+        [unroll] for (uint l = 0; l < 4; l++) {
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + 4 * s + l, q);
+            const uint h  = l < 2 ? qh0 : qh1;
+            const uint gi = (q & 0xFFu) | (((l & 1u) == 0 ? (h << 8) : (h << 4)) & 0x700u);
+            const float delta = (h & ((l & 1u) == 0 ? 0x08u : 0x80u)) != 0 ? -0.125f : 0.125f;
+            const float dl    = l < 2 ? dl1 : dl2;
+            [unroll] for (uint j = 0; j < 8; j++) {
+                const int gv = j < 4 ? sbyte_of(IQ1S_GRID_LO[gi], j) : sbyte_of(IQ1S_GRID_HI[gi], j - 4);
+                ACC(dl * ((float) gv + delta), blk * 256 + s * 32 + l * 8 + j);
+            }
+        }
+    }
 #elif defined(SRC0_Q6_K)
     // super-block of 256: 128 bytes ql, 64 bytes qh, 16 int8 scales, f16 d.
     // sub-block s: half h = s/4 (128 values), t = s%4 selects the quarter inside the half.

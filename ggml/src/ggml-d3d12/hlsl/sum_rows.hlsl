@@ -1,6 +1,7 @@
 #include "common.hlsli"
 
 // SUM_ROWS (f32): dst[0, i1, i2, i3] = sum of the row, one workgroup per row
+// With MEAN defined the same kernel divides by the row length, which is ggml's MEAN op.
 
 RWByteAddressBuffer src : register(u0);
 RWByteAddressBuffer dst : register(u1);
@@ -48,6 +49,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
     if (gtid.x == 0) {
-        STORE_F32(dst, offset_dst + i3 * stride_dst3 + i2 * stride_dst2 + i1 * stride_dst1, scratch[0]);
+#ifdef MEAN
+        const float res = scratch[0] / (float) ne0;
+#else
+        const float res = scratch[0];
+#endif
+        STORE_F32(dst, offset_dst + i3 * stride_dst3 + i2 * stride_dst2 + i1 * stride_dst1, res);
     }
 }

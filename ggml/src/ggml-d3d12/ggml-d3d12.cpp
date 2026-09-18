@@ -219,6 +219,11 @@ struct d3d12_device_ctx {
     double   t_compile_us     = 0;   // time inside shader compilation (part of encode)
     uint64_t n_compiles       = 0;
     bool     no_barrier       = false; // GGML_D3D12_NO_BARRIER: measurement only, results are wrong
+    // GGML_D3D12_DRED: device removed extended data. The breadcrumbs only say how many operations of
+    // the failing list completed, so the names of the dispatches in the list are recorded alongside
+    // them to turn that count into a shader name. Off by default: breadcrumbs cost per dispatch.
+    bool                     dred = false;
+    std::vector<std::string> dispatch_names;
     bool     no_fuse          = false; // GGML_D3D12_NO_FUSE: encode every node on its own, for bisecting
     uint32_t mm_tpr_max       = D3D12_WG_SIZE; // GGML_D3D12_MM_TPR: cap on matvec threads per row (1 = no reduction tree)
     uint32_t tiled_min_cols   = 0;   // GGML_D3D12_TILED: columns from which the tiled prompt kernel is used (0 = never)
@@ -323,7 +328,60 @@ static void ggml_d3d12_begin(d3d12_device_ctx & dev, bool compute) {
     if (compute) {
         dev.cmd_list->SetComputeRootSignature(dev.root_sig.get());
     }
+    dev.dispatch_names.clear();
     dev.recording = true;
+}
+
+// GGML_D3D12_DRED: print what the driver recorded about the removal. The breadcrumbs of the list
+// that did not finish give the number of completed operations; counting the dispatches among them
+// names the one that was in flight. A page fault address means the shader read out of bounds.
+static void ggml_d3d12_report_dred(d3d12_device_ctx & dev) {
+    com_ptr<ID3D12DeviceRemovedExtendedData1> dred;
+    if (FAILED(dev.device->QueryInterface(IID_PPV_ARGS(dred.put())))) {
+        GGML_LOG_ERROR("ggml_d3d12: DRED unavailable on this device\n");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bc = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&bc))) {
+        for (const D3D12_AUTO_BREADCRUMB_NODE1 * n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
+            const uint32_t done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            if (done == n->BreadcrumbCount) {
+                continue;   // this list ran to the end, it is not the one that failed
+            }
+            const std::string list_name = n->pCommandListDebugNameW ? ggml_d3d12_wide_to_utf8(n->pCommandListDebugNameW)
+                                                                    : std::string("?");
+            GGML_LOG_ERROR("ggml_d3d12: DRED list '%s': %u of %u operations completed\n", list_name.c_str(),
+                           (unsigned) done, (unsigned) n->BreadcrumbCount);
+            uint32_t ndisp = 0;
+            for (uint32_t i = 0; i < done; i++) {
+                if (n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH) {
+                    ndisp++;
+                }
+            }
+            if (ndisp < dev.dispatch_names.size()) {
+                GGML_LOG_ERROR("ggml_d3d12: DRED failed in dispatch %u: %s\n", (unsigned) ndisp,
+                               dev.dispatch_names[ndisp].c_str());
+                if (ndisp > 0) {
+                    GGML_LOG_ERROR("ggml_d3d12: DRED previous dispatch: %s\n", dev.dispatch_names[ndisp - 1].c_str());
+                }
+            } else {
+                GGML_LOG_ERROR("ggml_d3d12: DRED %u dispatches completed of %zu recorded\n", (unsigned) ndisp,
+                               dev.dispatch_names.size());
+            }
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA != 0) {
+        GGML_LOG_ERROR("ggml_d3d12: DRED page fault at GPU VA 0x%llx\n", (unsigned long long) pf.PageFaultVA);
+        for (const D3D12_DRED_ALLOCATION_NODE * a = pf.pHeadExistingAllocationNode; a; a = a->pNext) {
+            GGML_LOG_ERROR("ggml_d3d12: DRED   live allocation '%s' type %d\n",
+                           a->ObjectNameA ? a->ObjectNameA : "?", (int) a->AllocationType);
+        }
+        for (const D3D12_DRED_ALLOCATION_NODE * a = pf.pHeadRecentFreedAllocationNode; a; a = a->pNext) {
+            GGML_LOG_ERROR("ggml_d3d12: DRED   freed allocation '%s' type %d\n",
+                           a->ObjectNameA ? a->ObjectNameA : "?", (int) a->AllocationType);
+        }
+    }
 }
 
 static void ggml_d3d12_submit_and_wait(d3d12_device_ctx & dev) {
@@ -371,6 +429,11 @@ static void ggml_d3d12_submit_and_wait(d3d12_device_ctx & dev) {
     HRESULT removed = dev.device->GetDeviceRemovedReason();
     if (FAILED(removed)) {
         GGML_LOG_ERROR("ggml_d3d12: device removed, reason 0x%08lx\n", (unsigned long) removed);
+        if (dev.dred) {
+            ggml_d3d12_report_dred(dev);
+        } else {
+            GGML_LOG_ERROR("ggml_d3d12: set GGML_D3D12_DRED=1 to name the dispatch that failed\n");
+        }
         GGML_ABORT("ggml_d3d12: device removed");
     }
 }
@@ -695,6 +758,14 @@ static void ggml_d3d12_dispatch(d3d12_device_ctx &                       dev,
     if (timed) {
         dev.cmd_list->EndQuery(dev.query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * dev.query_count);
     }
+    if (dev.dred) {
+        // the shader name alone does not say which tensor failed, so keep the root constants too
+        std::string rec = pipeline.name + " wg=" + std::to_string(total_wg) + " params=";
+        for (size_t i = 0; i < params.size(); i++) {
+            rec += (i ? "," : "") + std::to_string(params[i]);
+        }
+        dev.dispatch_names.push_back(rec);
+    }
     dev.cmd_list->Dispatch(wg_x, wg_y, 1);
     dev.n_dispatches++;
 
@@ -915,6 +986,11 @@ static bool ggml_d3d12_mul_mat_vec_type(ggml_type t) {
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
             return true;
         default:
             return false;
@@ -1317,6 +1393,33 @@ static void ggml_d3d12_im2col(d3d12_device_ctx & dev, ggml_tensor * dst) {
     ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
 }
 
+static void ggml_d3d12_im2col_3d(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * src    = dst->src[1];
+    const int32_t *     op     = (const int32_t *) dst->op_params;
+    const uint32_t      IC     = (uint32_t) op[9];
+
+    std::vector<std::string> defines;
+    if (dst->type == GGML_TYPE_F16) {
+        defines = { "DST_F16", "USE_16BIT" };
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "im2col_3d", hlsl_im2col_3d, defines);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      N  = (uint32_t) (src->ne[3] / IC);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[3] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[1] / 4),
+        (uint32_t) op[0], (uint32_t) op[1], (uint32_t) op[2], (uint32_t) op[3], (uint32_t) op[4],
+        (uint32_t) op[5], (uint32_t) op[6], (uint32_t) op[7], (uint32_t) op[8],
+        IC, (uint32_t) src->ne[2], (uint32_t) src->ne[1], (uint32_t) src->ne[0],
+        (uint32_t) kernel->ne[2], (uint32_t) kernel->ne[1], (uint32_t) kernel->ne[0],
+        (uint32_t) (dst->ne[3] / N), (uint32_t) dst->ne[2], (uint32_t) dst->ne[1], ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
 static void ggml_d3d12_upscale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     const int32_t mode_flags = ggml_get_op_params_i32(dst, 0);
     float sf0 = (float) dst->ne[0] / src->ne[0];
@@ -1394,8 +1497,13 @@ static void ggml_d3d12_fill(d3d12_device_ctx & dev, ggml_tensor * dst) {
                         CEIL_DIV(threads, (uint32_t) D3D12_WG_SIZE));
 }
 
-static void ggml_d3d12_sum_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "sum_rows", hlsl_sum_rows, {});
+// MEAN reuses the sum_rows kernel, which divides by the row length when MEAN is defined
+static void ggml_d3d12_sum_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, bool mean = false) {
+    std::vector<std::string> defines;
+    if (mean) {
+        defines.push_back("MEAN");
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, mean ? "sum_rows_mean" : "sum_rows", hlsl_sum_rows, defines);
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(src);
@@ -1406,6 +1514,954 @@ static void ggml_d3d12_sum_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], n_rows,
     };
     ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// SUM: every element of src into one scalar, a single workgroup walking the whole tensor
+static void ggml_d3d12_sum(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "sum", hlsl_sum, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
+        (uint32_t) ggml_nrows(src),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, 1);
+}
+
+// ARGMAX: index of the largest element of each row, one workgroup per row
+static void ggml_d3d12_argmax(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "argmax", hlsl_argmax, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) src->ne[1];
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4),
+        (uint32_t) src->ne[0], n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// ARANGE: no input tensor, dst[i] = start + step * i
+static void ggml_d3d12_arange(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "arange", hlsl_arange, {});
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const float start = ggml_get_op_params_f32(dst, 0);
+    const float step  = ggml_get_op_params_f32(dst, 2);
+    const std::vector<uint32_t> params = {
+        bd.elem_offset, ne, ggml_d3d12_u32_from_f32(start), ggml_d3d12_u32_from_f32(step),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// DIAG_MASK_INF / DIAG_MASK_ZERO: copy src and replace everything right of the shifted diagonal
+static void ggml_d3d12_diag_mask(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, float value) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "diag_mask", hlsl_diag_mask, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset, ne,
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        (uint32_t) ggml_get_op_params_i32(dst, 0), ggml_d3d12_u32_from_f32(value),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// ROLL: cyclic shift along all four axes, one workgroup per destination row
+static void ggml_d3d12_roll(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "roll", hlsl_roll, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) dst->ne[3],
+        (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 1),
+        (uint32_t) ggml_get_op_params_i32(dst, 2), (uint32_t) ggml_get_op_params_i32(dst, 3),
+        n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// PAD: src copied into a larger dst at the left pads; outside, zero or a wrapped source element
+static void ggml_d3d12_pad(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    const bool circular = ggml_get_op_params_i32(dst, 8) != 0;
+    std::vector<std::string> defines;
+    if (circular) {
+        defines.push_back("CIRCULAR");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, circular ? "pad_circular" : "pad", hlsl_pad, defines);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[0] / 4), (uint32_t) (src->nb[1] / 4),
+        (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], ne,
+        (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 2),
+        (uint32_t) ggml_get_op_params_i32(dst, 4), (uint32_t) ggml_get_op_params_i32(dst, 6),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// PAD_REFLECT_1D: mirror the row into both margins, one workgroup per row
+static void ggml_d3d12_pad_reflect_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "pad_reflect_1d", hlsl_pad_reflect_1d, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) src->ne[0], (uint32_t) ggml_get_op_params_i32(dst, 0), n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// TIMESTEP_EMBEDDING: cos/sin ladder per input timestep, one workgroup per timestep
+static void ggml_d3d12_timestep_embedding(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, "timestep_embedding", hlsl_timestep_embedding, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      dim        = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    const uint32_t      max_period = (uint32_t) ggml_get_op_params_i32(dst, 1);
+    const uint32_t      ne00       = (uint32_t) src->ne[0];
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset, (uint32_t) (dst->nb[1] / 4),
+        ne00, dim / 2, dim, ggml_d3d12_u32_from_f32(-logf((float) max_period)),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, ne00);
+}
+
+// SET / ACC: dst takes a copy of src0, then src1 lands in the view described by op_params.
+// Two dispatches, because the copy has to be complete before the scatter overwrites part of it.
+static void ggml_d3d12_set_acc(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                               ggml_tensor * dst, bool acc) {
+    if (src0->data != dst->data) {
+        ggml_d3d12_cpy(dev, src0, dst);
+    }
+    std::vector<std::string> defines;
+    if (acc) {
+        defines.push_back("ACC");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, acc ? "set_acc_add" : "set_acc", hlsl_set_acc, defines);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(src1);
+    // the view strides and offset are byte counts in op_params; the kernel indexes in elements
+    const std::vector<uint32_t> params = {
+        b1.elem_offset, bd.elem_offset,
+        (uint32_t) (src1->nb[1] / 4), (uint32_t) (src1->nb[2] / 4), (uint32_t) (src1->nb[3] / 4),
+        (uint32_t) (ggml_get_op_params_i32(dst, 0) / 4), (uint32_t) (ggml_get_op_params_i32(dst, 1) / 4),
+        (uint32_t) (ggml_get_op_params_i32(dst, 2) / 4), (uint32_t) (ggml_get_op_params_i32(dst, 3) / 4),
+        (uint32_t) src1->ne[0], (uint32_t) src1->ne[1], (uint32_t) src1->ne[2],
+        n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, bd.va }, n_rows);
+}
+
+// CUMSUM: inclusive prefix sum along each row
+static void ggml_d3d12_cumsum(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "cumsum", hlsl_cumsum, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(src);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// TRI: keep one triangle of each matrix, zero the rest
+static void ggml_d3d12_tri(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "tri", hlsl_tri, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// COUNT_EQUAL: number of positions where the two i32 tensors agree, into an i64 scalar
+static void ggml_d3d12_count_equal(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                                   ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "count_equal", hlsl_count_equal, {});
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset * (uint32_t) ggml_type_size(dst->type),
+        (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
+        (uint32_t) (src1->nb[1] / 4), (uint32_t) (src1->nb[2] / 4), (uint32_t) (src1->nb[3] / 4),
+        (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2],
+        (uint32_t) ggml_nrows(src0),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, 1);
+}
+
+// ADD1: dst = src0 plus a scalar that lives in device memory
+static void ggml_d3d12_add1(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                            ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "add1", hlsl_add1, {});
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,
+        (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, n_rows);
+}
+
+// LEAKY_RELU: negative inputs scaled by the slope in op_params
+static void ggml_d3d12_leaky_relu(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "leaky_relu", hlsl_leaky_relu, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (dst->nb[1] / 4),
+        (uint32_t) dst->ne[0], n_rows,
+        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// GROUP_NORM: one workgroup per (channel group, batch)
+static void ggml_d3d12_group_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "group_norm", hlsl_group_norm, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t n_channels = (uint32_t) src->ne[2];
+    const uint32_t n_groups   = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    const uint32_t n_batches  = (uint32_t) src->ne[3];
+    float eps;
+    memcpy(&eps, (const int32_t *) dst->op_params + 1, sizeof(float));
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1],
+        n_channels, n_groups, CEIL_DIV(n_channels, n_groups), n_batches,
+        ggml_d3d12_u32_from_f32(eps),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_groups * n_batches);
+}
+
+// DIAG: vector to diagonal matrix, one workgroup per destination row
+static void ggml_d3d12_diag(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "diag", hlsl_diag, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+// POOL_1D: sliding window along the row only
+static void ggml_d3d12_pool_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<std::string> defines;
+    if (src->type == GGML_TYPE_F16) {
+        defines = { "SRC_F16", "USE_16BIT" };
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, src->type == GGML_TYPE_F16 ? "pool_1d_f16" : "pool_1d",
+                                hlsl_pool_1d, defines);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const int32_t * opts   = (const int32_t *) dst->op_params;
+    const uint32_t  n_rows = (uint32_t) ggml_nrows(src);
+    const size_t    ts     = ggml_type_size(src->type);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / ts), (uint32_t) (dst->nb[1] / 4),
+        (uint32_t) src->ne[0], (uint32_t) dst->ne[0],
+        (uint32_t) opts[1], (uint32_t) opts[2], (uint32_t) opts[3],
+        (uint32_t) (opts[0] == GGML_OP_POOL_MAX ? 1 : 0),
+        n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+}
+
+static void ggml_d3d12_dsv4_hc_pre(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * x = dst->src[0];
+    ggml_tensor * w = dst->src[1];
+    const bool gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    std::vector<std::string> defines;
+    if (gated) {
+        defines.push_back("GATED");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, gated ? "dsv4_hc_pre_gated" : "dsv4_hc_pre", hlsl_dsv4_hc_pre, defines);
+    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
+    const d3d12_binding bw = ggml_d3d12_bind_tensor(w);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bx.elem_offset, bw.elem_offset, bd.elem_offset,
+        (uint32_t) (x->nb[0] / 4), (uint32_t) (x->nb[1] / 4), (uint32_t) (x->nb[2] / 4),
+        (uint32_t) (w->nb[0] / 4), (uint32_t) (w->nb[1] / 4), (uint32_t) (w->nb[2] / 4),
+        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4),
+        (uint32_t) x->ne[0], (uint32_t) x->ne[1],
+        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bx.va, bw.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_dsv4_hc_post(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * x = dst->src[0];
+    ggml_tensor * r = dst->src[1];
+    ggml_tensor * p = dst->src[2];
+    ggml_tensor * c = dst->src[3];
+
+    std::vector<std::string> defines;
+    if (c) {
+        defines.push_back("HAS_COMB");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, c ? "dsv4_hc_post_comb" : "dsv4_hc_post", hlsl_dsv4_hc_post, defines);
+    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
+    const d3d12_binding br = ggml_d3d12_bind_tensor(r);
+    const d3d12_binding bp = ggml_d3d12_bind_tensor(p);
+    // with no comb matrix the slot still has to be bound; the residual stands in and is never read
+    const d3d12_binding bc = ggml_d3d12_bind_tensor(c ? c : r);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bx.elem_offset, br.elem_offset, bp.elem_offset, bc.elem_offset, bd.elem_offset,
+        (uint32_t) (x->nb[0] / 4), (uint32_t) (x->nb[1] / 4),
+        (uint32_t) (r->nb[0] / 4), (uint32_t) (r->nb[1] / 4), (uint32_t) (r->nb[2] / 4),
+        (uint32_t) (p->nb[0] / 4), (uint32_t) (p->nb[1] / 4),
+        (uint32_t) (c ? c->nb[0] / 4 : 0), (uint32_t) (c ? c->nb[1] / 4 : 0), (uint32_t) (c ? c->nb[2] / 4 : 0),
+        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
+        (uint32_t) x->ne[0], (uint32_t) r->ne[1],
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bx.va, br.va, bp.va, bc.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_dsv4_hc_comb(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * m = dst->src[0];
+    ggml_tensor * s = dst->src[1];
+    ggml_tensor * b = dst->src[2];
+
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "dsv4_hc_comb", hlsl_dsv4_hc_comb, {});
+    const d3d12_binding bm = ggml_d3d12_bind_tensor(m);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(s);
+    const d3d12_binding bb = ggml_d3d12_bind_tensor(b);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t n_tokens = (uint32_t) m->ne[1];
+    const std::vector<uint32_t> params = {
+        bm.elem_offset, bs.elem_offset, bb.elem_offset, bd.elem_offset,
+        (uint32_t) (m->nb[0] / 4), (uint32_t) (m->nb[1] / 4),
+        (uint32_t) (s->nb[0] / 4), (uint32_t) (b->nb[0] / 4),
+        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
+        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
+        n_tokens,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bm.va, bs.va, bb.va, bd.va },
+                        CEIL_DIV(n_tokens, (uint32_t) D3D12_WG_SIZE));
+}
+
+// OPT_STEP_SGD / OPT_STEP_ADAMW: dst is a view of src0, so the update lands in src0's own buffer
+static void ggml_d3d12_opt_step(d3d12_device_ctx & dev, ggml_tensor * dst, bool adamw) {
+    ggml_tensor * w = dst->src[0];
+    ggml_tensor * g = dst->src[1];
+    ggml_tensor * m = adamw ? dst->src[2] : g;
+    ggml_tensor * v = adamw ? dst->src[3] : g;
+    ggml_tensor * p = adamw ? dst->src[4] : dst->src[2];
+
+    std::vector<std::string> defines;
+    if (adamw) {
+        defines.push_back("ADAMW");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, adamw ? "opt_step_adamw" : "opt_step_sgd", hlsl_opt_step, defines);
+    const d3d12_binding bw = ggml_d3d12_bind_tensor(w);
+    const d3d12_binding bg = ggml_d3d12_bind_tensor(g);
+    const d3d12_binding bm = ggml_d3d12_bind_tensor(m);
+    const d3d12_binding bv = ggml_d3d12_bind_tensor(v);
+    const d3d12_binding bp = ggml_d3d12_bind_tensor(p);
+    const uint32_t ne = (uint32_t) ggml_nelements(w);
+    const std::vector<uint32_t> params = {
+        bw.elem_offset, bg.elem_offset, bm.elem_offset, bv.elem_offset, bp.elem_offset, ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bw.va, bg.va, bm.va, bv.va, bp.va },
+                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_silu_back(d3d12_device_ctx & dev, ggml_tensor * dy, ggml_tensor * x, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "silu_back", hlsl_silu_back, {});
+    const d3d12_binding bg = ggml_d3d12_bind_tensor(dy);
+    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = { bg.elem_offset, bx.elem_offset, bd.elem_offset, ne };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bg.va, bx.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_repeat_back(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "repeat_back", hlsl_repeat_back, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) dst->ne[3],
+        (uint32_t) (src->ne[0] / dst->ne[0]), (uint32_t) (src->ne[1] / dst->ne[1]),
+        (uint32_t) (src->ne[2] / dst->ne[2]), (uint32_t) (src->ne[3] / dst->ne[3]),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_rms_norm_back(d3d12_device_ctx & dev, ggml_tensor * dz, ggml_tensor * x, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rms_norm_back", hlsl_rms_norm_back, {});
+    const d3d12_binding bz = ggml_d3d12_bind_tensor(dz);
+    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bz.elem_offset, bx.elem_offset, bd.elem_offset,
+        (uint32_t) (dz->nb[1] / 4), (uint32_t) (dz->nb[2] / 4), (uint32_t) (dz->nb[3] / 4),
+        (uint32_t) (x->nb[1] / 4), (uint32_t) (x->nb[2] / 4), (uint32_t) (x->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
+        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bz.va, bx.va, bd.va }, n_rows);
+}
+
+static void ggml_d3d12_soft_max_back(d3d12_device_ctx & dev, ggml_tensor * dy, ggml_tensor * y, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "soft_max_back", hlsl_soft_max_back, {});
+    const d3d12_binding bg = ggml_d3d12_bind_tensor(dy);
+    const d3d12_binding by = ggml_d3d12_bind_tensor(y);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bg.elem_offset, by.elem_offset, bd.elem_offset, (uint32_t) dst->ne[0], n_rows,
+        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bg.va, by.va, bd.va }, n_rows);
+}
+
+// the loss is a single scalar, so the whole reduction runs in one workgroup
+static void ggml_d3d12_cross_entropy_loss(d3d12_device_ctx & dev, ggml_tensor * s0, ggml_tensor * s1, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "cross_entropy_loss", hlsl_cross_entropy_loss, {});
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(s0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(s1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset, (uint32_t) s0->ne[0], (uint32_t) ggml_nrows(s0),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, 1);
+}
+
+static void ggml_d3d12_cross_entropy_loss_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, "cross_entropy_loss_back", hlsl_cross_entropy_loss_back, {});
+    const d3d12_binding bg = ggml_d3d12_bind_tensor(dst->src[0]);
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(dst->src[1]);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(dst->src[2]);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bg.elem_offset, b0.elem_offset, b1.elem_offset, bd.elem_offset, (uint32_t) dst->ne[0], n_rows,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bg.va, b0.va, b1.va, bd.va }, n_rows);
+}
+
+static void ggml_d3d12_get_rows_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    ggml_tensor * ids = dst->src[1];
+
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "get_rows_back", hlsl_get_rows_back, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bi = ggml_d3d12_bind_tensor(ids);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bi.elem_offset, bd.elem_offset,
+        (uint32_t) dst->ne[0], n_rows, (uint32_t) ggml_nelements(ids),
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (dst->nb[1] / 4),
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, n_rows);
+}
+
+static void ggml_d3d12_im2col_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * src0 = dst->src[0];   // gradients of the im2col output
+    ggml_tensor * src1 = dst->src[1];   // the convolution kernel, only its shape is used
+
+    const int32_t s0 = ggml_get_op_params_i32(dst, 0);
+    const int32_t s1 = ggml_get_op_params_i32(dst, 1);
+    const int32_t p0 = ggml_get_op_params_i32(dst, 2);
+    const int32_t p1 = ggml_get_op_params_i32(dst, 3);
+    const int32_t d0 = ggml_get_op_params_i32(dst, 4);
+    const int32_t d1 = ggml_get_op_params_i32(dst, 5);
+    const bool is_2D = ggml_get_op_params_i32(dst, 6) == 1;
+
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "im2col_back", hlsl_im2col_back, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    // in the 1D case the CPU pins ioh to 0 and ignores s1/p1/d1, so neutral values give the same result
+    const std::vector<uint32_t> params = {
+        (uint32_t) (is_2D ? dst->ne[3] : dst->ne[2]),
+        (uint32_t) (is_2D ? dst->ne[2] : dst->ne[1]),
+        (uint32_t) (is_2D ? dst->ne[1] : 1),
+        (uint32_t) dst->ne[0],
+        (uint32_t) (is_2D ? src1->ne[1] : 1),
+        (uint32_t) src1->ne[0],
+        (uint32_t) (is_2D ? src0->ne[2] : 1),
+        (uint32_t) src0->ne[1],
+        (uint32_t) s0, (uint32_t) (is_2D ? s1 : 1),
+        (uint32_t) p0, (uint32_t) (is_2D ? p1 : 0),
+        (uint32_t) d0, (uint32_t) (is_2D ? d1 : 1),
+        bs.elem_offset, bd.elem_offset, ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_lightning_indexer(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * q = dst->src[0];
+    ggml_tensor * k = dst->src[1];
+    ggml_tensor * w = dst->src[2];
+    ggml_tensor * m = dst->src[3];
+
+    std::vector<std::string> defines = { "USE_16BIT" };
+    if (k->type == GGML_TYPE_F16) {
+        defines.push_back("K_F16");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, k->type == GGML_TYPE_F16 ? "lightning_indexer_f16" : "lightning_indexer",
+                                hlsl_lightning_indexer, defines);
+    const d3d12_binding bq = ggml_d3d12_bind_tensor(q);
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(k);
+    const d3d12_binding bw = ggml_d3d12_bind_tensor(w);
+    const d3d12_binding bm = ggml_d3d12_bind_tensor(m);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const size_t   kts = ggml_type_size(k->type);
+    const uint32_t ne  = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bq.elem_offset, bk.elem_offset, bw.elem_offset, bm.elem_offset, bd.elem_offset,
+        (uint32_t) (q->nb[1] / 4), (uint32_t) (q->nb[2] / 4), (uint32_t) (q->nb[3] / 4),
+        (uint32_t) (k->nb[2] / kts), (uint32_t) (k->nb[3] / kts),
+        (uint32_t) (w->nb[1] / 4), (uint32_t) (w->nb[3] / 4),
+        (uint32_t) (m->nb[1] / 2), (uint32_t) (m->nb[3] / 2),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) q->ne[0], (uint32_t) q->ne[1], (uint32_t) q->ne[2], (uint32_t) k->ne[2],
+        (uint32_t) m->ne[3],
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bq.va, bk.va, bw.va, bm.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// RWKV_WKV6 / GATED_LINEAR_ATTN / RWKV_WKV7 all carry a per-sequence state through the tokens and
+// lay dst out as C*T outputs followed by that state, so they share these shape helpers.
+struct d3d12_wkv_shape {
+    uint32_t cc;       // C
+    uint32_t hs;       // head size
+    uint32_t tps;      // tokens per sequence
+    uint32_t s_off;    // C * T
+    uint32_t n_jobs;   // n_seqs * C
+};
+
+static d3d12_wkv_shape ggml_d3d12_wkv_shape(const ggml_tensor * dst, const ggml_tensor * state) {
+    const uint32_t T      = (uint32_t) dst->src[1]->ne[2];
+    const uint32_t cc     = (uint32_t) dst->ne[0];
+    const uint32_t heads  = (uint32_t) dst->src[1]->ne[1];
+    const uint32_t n_seqs = (uint32_t) state->ne[1];
+    return { cc, cc / heads, T / n_seqs, cc * T, n_seqs * cc };
+}
+
+static void ggml_d3d12_rwkv_wkv6(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rwkv_wkv6", hlsl_rwkv_wkv6, {});
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(dst->src[0]);
+    const d3d12_binding bv = ggml_d3d12_bind_tensor(dst->src[1]);
+    const d3d12_binding br = ggml_d3d12_bind_tensor(dst->src[2]);
+    const d3d12_binding bf = ggml_d3d12_bind_tensor(dst->src[3]);
+    const d3d12_binding bt = ggml_d3d12_bind_tensor(dst->src[4]);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(dst->src[5]);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d12_wkv_shape sh = ggml_d3d12_wkv_shape(dst, dst->src[5]);
+    const std::vector<uint32_t> params = {
+        bk.elem_offset, bv.elem_offset, br.elem_offset, bf.elem_offset, bt.elem_offset,
+        bs.elem_offset, bd.elem_offset,
+        sh.cc, sh.hs, sh.tps, sh.s_off, sh.n_jobs,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params,
+                        { bk.va, bv.va, br.va, bf.va, bt.va, bs.va, bd.va },
+                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_gated_linear_attn(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "gated_linear_attn", hlsl_gated_linear_attn, {});
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(dst->src[0]);
+    const d3d12_binding bv = ggml_d3d12_bind_tensor(dst->src[1]);
+    const d3d12_binding bq = ggml_d3d12_bind_tensor(dst->src[2]);
+    const d3d12_binding bg = ggml_d3d12_bind_tensor(dst->src[3]);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(dst->src[4]);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d12_wkv_shape sh = ggml_d3d12_wkv_shape(dst, dst->src[4]);
+    const std::vector<uint32_t> params = {
+        bk.elem_offset, bv.elem_offset, bq.elem_offset, bg.elem_offset, bs.elem_offset, bd.elem_offset,
+        sh.cc, sh.hs, sh.tps, sh.s_off,
+        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        sh.n_jobs,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bv.va, bq.va, bg.va, bs.va, bd.va },
+                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_rwkv_wkv7(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rwkv_wkv7", hlsl_rwkv_wkv7, {});
+    const d3d12_binding br = ggml_d3d12_bind_tensor(dst->src[0]);
+    const d3d12_binding bw = ggml_d3d12_bind_tensor(dst->src[1]);
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(dst->src[2]);
+    const d3d12_binding bv = ggml_d3d12_bind_tensor(dst->src[3]);
+    const d3d12_binding ba = ggml_d3d12_bind_tensor(dst->src[4]);
+    const d3d12_binding bb = ggml_d3d12_bind_tensor(dst->src[5]);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(dst->src[6]);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d12_wkv_shape sh = ggml_d3d12_wkv_shape(dst, dst->src[6]);
+    const std::vector<uint32_t> params = {
+        br.elem_offset, bw.elem_offset, bk.elem_offset, bv.elem_offset, ba.elem_offset,
+        bb.elem_offset, bs.elem_offset, bd.elem_offset,
+        sh.cc, sh.hs, sh.tps, sh.s_off, sh.n_jobs,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params,
+                        { br.va, bw.va, bk.va, bv.va, ba.va, bb.va, bs.va, bd.va },
+                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_conv_2d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<std::string> defines;
+    if (knl->type == GGML_TYPE_F16) {
+        defines = { "KNL_F16", "USE_16BIT" };
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_f16" : "conv_2d", hlsl_conv_2d, defines);
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const int32_t * op = (const int32_t *) dst->op_params;
+    const uint32_t  ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bk.elem_offset, bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) knl->ne[0], (uint32_t) knl->ne[1], (uint32_t) src->ne[0], (uint32_t) src->ne[1],
+        (uint32_t) src->ne[2],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) op[0], (uint32_t) op[1], (uint32_t) op[2], (uint32_t) op[3], (uint32_t) op[4], (uint32_t) op[5],
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_conv_3d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<std::string> defines;
+    if (knl->type == GGML_TYPE_F16) {
+        defines = { "KNL_F16", "USE_16BIT" };
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_3d_f16" : "conv_3d", hlsl_conv_3d, defines);
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const int32_t * op = (const int32_t *) dst->op_params;
+    const uint32_t  ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bk.elem_offset, bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) knl->ne[0], (uint32_t) knl->ne[1], (uint32_t) knl->ne[2],
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
+        (uint32_t) op[9], (uint32_t) op[11],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) op[0], (uint32_t) op[1], (uint32_t) op[2], (uint32_t) op[3], (uint32_t) op[4],
+        (uint32_t) op[5], (uint32_t) op[6], (uint32_t) op[7], (uint32_t) op[8],
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_conv_transpose_2d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src,
+                                         ggml_tensor * dst) {
+    std::vector<std::string> defines;
+    if (knl->type == GGML_TYPE_F16) {
+        defines = { "KNL_F16", "USE_16BIT" };
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_transpose_2d_f16" : "conv_transpose_2d",
+                                hlsl_conv_transpose_2d, defines);
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const size_t   ts = ggml_type_size(knl->type);
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bk.elem_offset, bs.elem_offset, bd.elem_offset,
+        (uint32_t) (knl->nb[1] / ts), (uint32_t) (knl->nb[2] / ts), (uint32_t) (knl->nb[3] / ts),
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) knl->ne[0], (uint32_t) knl->ne[1], (uint32_t) src->ne[0], (uint32_t) src->ne[1],
+        (uint32_t) knl->ne[3],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_col2im_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "col2im_1d", hlsl_col2im_1d, {});
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t k_oc = (uint32_t) src->ne[0];
+    const uint32_t oc   = (uint32_t) ggml_get_op_params_i32(dst, 1);
+    const uint32_t ne   = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        k_oc, (uint32_t) src->ne[1], k_oc / oc, (uint32_t) dst->ne[0],
+        (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 2),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_conv_transpose_1d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src,
+                                         ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "conv_transpose_1d", hlsl_conv_transpose_1d, {});
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bk.elem_offset, bs.elem_offset, bd.elem_offset,
+        (uint32_t) (knl->nb[1] / 4), (uint32_t) (knl->nb[2] / 4),
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (dst->nb[1] / 4),
+        (uint32_t) knl->ne[0], (uint32_t) knl->ne[2], (uint32_t) src->ne[0],
+        (uint32_t) dst->ne[0], (uint32_t) ggml_get_op_params_i32(dst, 0),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+static void ggml_d3d12_conv_2d_dw(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<std::string> defines;
+    if (knl->type == GGML_TYPE_F16) {
+        defines = { "KNL_F16", "USE_16BIT" };
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16" : "conv_2d_dw",
+                                hlsl_conv_2d_dw, defines);
+    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const int32_t * opts   = (const int32_t *) dst->op_params;
+    const uint32_t  ne     = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bk.elem_offset, bs.elem_offset, bd.elem_offset,
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        (uint32_t) knl->ne[0], (uint32_t) knl->ne[1],
+        (uint32_t) src->ne[2],
+        (uint32_t) opts[0], (uint32_t) opts[1], (uint32_t) opts[2],
+        (uint32_t) opts[3], (uint32_t) opts[4], (uint32_t) opts[5],
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// WIN_PART / WIN_UNPART: index remap between an image and its window tiling
+static void ggml_d3d12_win_part(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, bool unpart) {
+    std::vector<std::string> defines;
+    if (unpart) {
+        defines.push_back("UNPART");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, unpart ? "win_unpart" : "win_part", hlsl_win_part, defines);
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    uint32_t w, windows_across;
+    if (unpart) {
+        w = (uint32_t) ggml_get_op_params_i32(dst, 0);
+        // npx: how many windows span a padded row, which is the stride between window rows in src
+        const uint32_t pad = (w - (uint32_t) dst->ne[1] % w) % w;
+        windows_across = (pad + (uint32_t) dst->ne[1]) / w;
+    } else {
+        windows_across = (uint32_t) ggml_get_op_params_i32(dst, 0);
+        w              = (uint32_t) ggml_get_op_params_i32(dst, 2);
+    }
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        ne, windows_across, w,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// GET_REL_POS: f16 relative position lookup
+static void ggml_d3d12_get_rel_pos(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, "get_rel_pos", hlsl_get_rel_pos, { "USE_16BIT" });
+    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) src->ne[0], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// ADD_REL_POS: both biases added in one gather, so no copy pass is needed
+static void ggml_d3d12_add_rel_pos(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                                   ggml_tensor * src2, ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "add_rel_pos", hlsl_add_rel_pos, {});
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding b2 = ggml_d3d12_bind_tensor(src2);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, b2.elem_offset, bd.elem_offset,
+        (uint32_t) src1->ne[0], ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// SOLVE_TRI: forward substitution, one right-hand-side column per thread
+static void ggml_d3d12_solve_tri(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                                 ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "solve_tri", hlsl_solve_tri, {});
+    const d3d12_binding ba = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding bb = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t n      = (uint32_t) src0->ne[0];
+    const uint32_t k      = (uint32_t) src1->ne[0];
+    const uint32_t n_jobs = (uint32_t) (src0->ne[2] * src0->ne[3]) * k;
+    const std::vector<uint32_t> params = {
+        ba.elem_offset, bb.elem_offset, bd.elem_offset,
+        (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
+        (uint32_t) (src1->nb[2] / 4), (uint32_t) (src1->nb[3] / 4),
+        (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        n, k, (uint32_t) src0->ne[2], n_jobs,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { ba.va, bb.va, bd.va },
+                        CEIL_DIV(n_jobs, (uint32_t) D3D12_WG_SIZE));
+}
+
+// OUT_PROD: contraction over src0's second dimension, one destination element per thread
+static void ggml_d3d12_out_prod(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+                                ggml_tensor * dst) {
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "out_prod", hlsl_out_prod, {});
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,
+        (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
+        (uint32_t) (src1->nb[0] / 4), (uint32_t) (src1->nb[1] / 4),
+        (uint32_t) (src1->nb[2] / 4), (uint32_t) (src1->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) src0->ne[1],
+        (uint32_t) (dst->ne[2] / src0->ne[2]), (uint32_t) (dst->ne[3] / src0->ne[3]),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
+// SSM_SCAN: one thread per (sequence, head, dim); the token loop stays inside the thread
+static void ggml_d3d12_ssm_scan(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * s0  = dst->src[0];
+    ggml_tensor * x   = dst->src[1];
+    ggml_tensor * dt  = dst->src[2];
+    ggml_tensor * A   = dst->src[3];
+    ggml_tensor * B   = dst->src[4];
+    ggml_tensor * C   = dst->src[5];
+    ggml_tensor * ids = dst->src[6];
+
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "ssm_scan", hlsl_ssm_scan, {});
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(s0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(x);
+    const d3d12_binding b2 = ggml_d3d12_bind_tensor(dt);
+    const d3d12_binding b3 = ggml_d3d12_bind_tensor(A);
+    const d3d12_binding b4 = ggml_d3d12_bind_tensor(B);
+    const d3d12_binding b5 = ggml_d3d12_bind_tensor(C);
+    const d3d12_binding b6 = ggml_d3d12_bind_tensor(ids);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+
+    const uint32_t nc = (uint32_t) s0->ne[0];
+    const uint32_t nr = (uint32_t) s0->ne[1];
+    const uint32_t nh = (uint32_t) x->ne[1];
+    const uint32_t ng = (uint32_t) B->ne[1];
+    const uint32_t nt = (uint32_t) x->ne[2];
+    const uint32_t ns = (uint32_t) x->ne[3];
+    const uint32_t n_jobs = ns * nh * nr;
+
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, b2.elem_offset, b3.elem_offset,
+        b4.elem_offset, b5.elem_offset, b6.elem_offset, bd.elem_offset,
+        (uint32_t) (s0->nb[3] / 4),
+        (uint32_t) (x->nb[2] / 4), (uint32_t) (x->nb[3] / 4),
+        (uint32_t) (dt->nb[1] / 4), (uint32_t) (dt->nb[2] / 4),
+        (uint32_t) (B->nb[2] / 4), (uint32_t) (B->nb[3] / 4),
+        (uint32_t) (C->nb[2] / 4), (uint32_t) (C->nb[3] / 4),
+        nc, nr, nh, ng, nt, ns,
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) ggml_nelements(x),          // s_off, in elements
+        (uint32_t) (A->ne[0] == 1 ? 1 : 0),    // Mamba-2 has a scalar decay per head
+        n_jobs,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params,
+                        { b0.va, b1.va, b2.va, b3.va, b4.va, b5.va, b6.va, bd.va },
+                        CEIL_DIV(n_jobs, (uint32_t) D3D12_WG_SIZE));
 }
 
 static void ggml_d3d12_add_id(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids,
@@ -1726,13 +2782,18 @@ static void ggml_d3d12_gated_delta_net(d3d12_device_ctx & dev, ggml_tensor * dst
     }
 }
 
-static void ggml_d3d12_rope(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * src2, ggml_tensor * dst) {
+static void ggml_d3d12_rope(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * src2,
+                            ggml_tensor * dst, bool backward = false) {
     std::vector<std::string> defines;
     ggml_d3d12_float_type_define(dst->type, defines);
     if (src2) {
         defines.push_back("FF_FUNC");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rope", hlsl_rope, defines);
+    if (backward) {
+        defines.push_back("BACKWARD");
+    }
+    d3d12_pipeline & pipeline =
+        ggml_d3d12_get_pipeline(dev, backward ? "rope_back" : "rope", hlsl_rope, defines);
 
     const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
     const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
@@ -1925,6 +2986,7 @@ static void ggml_d3d12_encode_node(d3d12_device_ctx & dev, ggml_tensor * node) {
             return;
         case GGML_OP_CPY:
         case GGML_OP_CONT:
+        case GGML_OP_DUP:
             ggml_d3d12_cpy(dev, node->src[0], node);
             return;
         case GGML_OP_ADD:
@@ -1985,6 +3047,84 @@ static void ggml_d3d12_encode_node(d3d12_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_SUM_ROWS:
             ggml_d3d12_sum_rows(dev, node->src[0], node);
             return;
+        case GGML_OP_MEAN:
+            ggml_d3d12_sum_rows(dev, node->src[0], node, true);
+            return;
+        case GGML_OP_SUM:
+            ggml_d3d12_sum(dev, node->src[0], node);
+            return;
+        case GGML_OP_ARGMAX:
+            ggml_d3d12_argmax(dev, node->src[0], node);
+            return;
+        case GGML_OP_ARANGE:
+            ggml_d3d12_arange(dev, node);
+            return;
+        case GGML_OP_DIAG_MASK_INF:
+            ggml_d3d12_diag_mask(dev, node->src[0], node, -INFINITY);
+            return;
+        case GGML_OP_DIAG_MASK_ZERO:
+            ggml_d3d12_diag_mask(dev, node->src[0], node, 0.0f);
+            return;
+        case GGML_OP_ROLL:
+            ggml_d3d12_roll(dev, node->src[0], node);
+            return;
+        case GGML_OP_PAD:
+            ggml_d3d12_pad(dev, node->src[0], node);
+            return;
+        case GGML_OP_PAD_REFLECT_1D:
+            ggml_d3d12_pad_reflect_1d(dev, node->src[0], node);
+            return;
+        case GGML_OP_TIMESTEP_EMBEDDING:
+            ggml_d3d12_timestep_embedding(dev, node->src[0], node);
+            return;
+        case GGML_OP_SET:
+            ggml_d3d12_set_acc(dev, node->src[0], node->src[1], node, false);
+            return;
+        case GGML_OP_ACC:
+            ggml_d3d12_set_acc(dev, node->src[0], node->src[1], node, true);
+            return;
+        case GGML_OP_CUMSUM:
+            ggml_d3d12_cumsum(dev, node->src[0], node);
+            return;
+        case GGML_OP_TRI:
+            ggml_d3d12_tri(dev, node->src[0], node);
+            return;
+        case GGML_OP_COUNT_EQUAL:
+            ggml_d3d12_count_equal(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_ADD1:
+            ggml_d3d12_add1(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_LEAKY_RELU:
+            ggml_d3d12_leaky_relu(dev, node->src[0], node);
+            return;
+        case GGML_OP_GROUP_NORM:
+            ggml_d3d12_group_norm(dev, node->src[0], node);
+            return;
+        case GGML_OP_DIAG:
+            ggml_d3d12_diag(dev, node->src[0], node);
+            return;
+        case GGML_OP_POOL_1D:
+            ggml_d3d12_pool_1d(dev, node->src[0], node);
+            return;
+        case GGML_OP_WIN_PART:
+            ggml_d3d12_win_part(dev, node->src[0], node, false);
+            return;
+        case GGML_OP_WIN_UNPART:
+            ggml_d3d12_win_part(dev, node->src[0], node, true);
+            return;
+        case GGML_OP_GET_REL_POS:
+            ggml_d3d12_get_rel_pos(dev, node->src[0], node);
+            return;
+        case GGML_OP_ADD_REL_POS:
+            ggml_d3d12_add_rel_pos(dev, node->src[0], node->src[1], node->src[2], node);
+            return;
+        case GGML_OP_SOLVE_TRI:
+            ggml_d3d12_solve_tri(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_OUT_PROD:
+            ggml_d3d12_out_prod(dev, node->src[0], node->src[1], node);
+            return;
         case GGML_OP_ADD_ID:
             ggml_d3d12_add_id(dev, node->src[0], node->src[1], node->src[2], node);
             return;
@@ -1994,8 +3134,86 @@ static void ggml_d3d12_encode_node(d3d12_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_SSM_CONV:
             ggml_d3d12_ssm_conv(dev, node->src[0], node->src[1], node);
             return;
+        case GGML_OP_SSM_SCAN:
+            ggml_d3d12_ssm_scan(dev, node);
+            return;
+        case GGML_OP_CONV_2D_DW:
+            ggml_d3d12_conv_2d_dw(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_CONV_TRANSPOSE_1D:
+            ggml_d3d12_conv_transpose_1d(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_COL2IM_1D:
+            ggml_d3d12_col2im_1d(dev, node->src[0], node);
+            return;
+        case GGML_OP_IM2COL_3D:
+            ggml_d3d12_im2col_3d(dev, node);
+            return;
+        case GGML_OP_CONV_TRANSPOSE_2D:
+            ggml_d3d12_conv_transpose_2d(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_CONV_2D:
+            ggml_d3d12_conv_2d(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_CONV_3D:
+            ggml_d3d12_conv_3d(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_LIGHTNING_INDEXER:
+            ggml_d3d12_lightning_indexer(dev, node);
+            return;
+        case GGML_OP_DSV4_HC_PRE:
+            ggml_d3d12_dsv4_hc_pre(dev, node);
+            return;
+        case GGML_OP_DSV4_HC_POST:
+            ggml_d3d12_dsv4_hc_post(dev, node);
+            return;
+        case GGML_OP_DSV4_HC_COMB:
+            ggml_d3d12_dsv4_hc_comb(dev, node);
+            return;
+        case GGML_OP_RWKV_WKV6:
+            ggml_d3d12_rwkv_wkv6(dev, node);
+            return;
+        case GGML_OP_GATED_LINEAR_ATTN:
+            ggml_d3d12_gated_linear_attn(dev, node);
+            return;
+        case GGML_OP_RWKV_WKV7:
+            ggml_d3d12_rwkv_wkv7(dev, node);
+            return;
         case GGML_OP_ROPE:
             ggml_d3d12_rope(dev, node->src[0], node->src[1], node->src[2], node);
+            return;
+        case GGML_OP_ROPE_BACK:
+            ggml_d3d12_rope(dev, node->src[0], node->src[1], node->src[2], node, true);
+            return;
+        case GGML_OP_OPT_STEP_SGD:
+            ggml_d3d12_opt_step(dev, node, false);
+            return;
+        case GGML_OP_OPT_STEP_ADAMW:
+            ggml_d3d12_opt_step(dev, node, true);
+            return;
+        case GGML_OP_SILU_BACK:
+            ggml_d3d12_silu_back(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_REPEAT_BACK:
+            ggml_d3d12_repeat_back(dev, node->src[0], node);
+            return;
+        case GGML_OP_RMS_NORM_BACK:
+            ggml_d3d12_rms_norm_back(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_SOFT_MAX_BACK:
+            ggml_d3d12_soft_max_back(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            ggml_d3d12_cross_entropy_loss(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            ggml_d3d12_cross_entropy_loss_back(dev, node);
+            return;
+        case GGML_OP_IM2COL_BACK:
+            ggml_d3d12_im2col_back(dev, node);
+            return;
+        case GGML_OP_GET_ROWS_BACK:
+            ggml_d3d12_get_rows_back(dev, node);
             return;
         case GGML_OP_GLU:
             ggml_d3d12_glu(dev, node->src[0], node->src[1], node);
@@ -2365,6 +3583,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
             return true;
         case GGML_OP_CPY:
         case GGML_OP_CONT:
+        case GGML_OP_DUP:
             return type_ok(op->type) && type_ok(src0->type);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
@@ -2403,6 +3622,15 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
         case GGML_OP_IM2COL:
             return src1->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                    ggml_is_contiguous(op) && ggml_nelements(op) <= UINT32_MAX && ggml_nelements(src1) <= UINT32_MAX;
+        case GGML_OP_IM2COL_3D:
+            {
+                // IC comes from op_params, not from a shape, so it has to be sane before N is derived from it
+                const int32_t ic = ggml_get_op_params_i32(op, 9);
+                return src1->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                       src1->nb[0] == sizeof(float) && ggml_is_contiguous(op) &&
+                       ic > 0 && src1->ne[3] % ic == 0 &&
+                       ggml_nelements(op) <= UINT32_MAX && ggml_nelements(src1) <= UINT32_MAX;
+            }
         case GGML_OP_POOL_2D: {
             const ggml_op_pool pool = (ggml_op_pool) ggml_get_op_params_i32(op, 0);
             return op->type == GGML_TYPE_F32 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
@@ -2420,7 +3648,101 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
             return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op) &&
                    ggml_nbytes(op) < (1ull << 30);
         case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN:
             return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(src0);
+        case GGML_OP_SUM:
+            // one scalar out; the kernel accumulates in f32 where the CPU uses f64
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_scalar(op) &&
+                   ggml_is_contiguous_rows(src0) && ggml_nelements(src0) <= UINT32_MAX;
+        case GGML_OP_ARGMAX:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous_rows(src0) && ggml_is_contiguous(op);
+        case GGML_OP_ARANGE:
+            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_DIAG_MASK_INF:
+        case GGML_OP_DIAG_MASK_ZERO:
+            // the flat index assumes both sides are contiguous, which is what the CPU asserts too
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_ROLL:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   ggml_are_same_shape(src0, op);
+        case GGML_OP_PAD:
+            // dst is addressed by a flat index, as the CPU does; src keeps its strides
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_PAD_REFLECT_1D:
+            // reflection may not read past the far edge of the source row
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   ggml_get_op_params_i32(op, 0) < src0->ne[0] && ggml_get_op_params_i32(op, 1) < src0->ne[0];
+        case GGML_OP_TIMESTEP_EMBEDDING:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        case GGML_OP_SOLVE_TRI:
+            // A, B and X are indexed with n and k directly, so their rows must be packed
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op);
+        case GGML_OP_OUT_PROD:
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_GET_REL_POS:
+            return src0->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16 && ctx->caps.native_16bit &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_ADD_REL_POS:
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_GROUP_NORM:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   ggml_are_same_shape(src0, op);
+        case GGML_OP_DIAG:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        case GGML_OP_POOL_1D: {
+            const ggml_op_pool pool = (ggml_op_pool) ggml_get_op_params_i32(op, 0);
+            return op->type == GGML_TYPE_F32 && (src0->type == GGML_TYPE_F32 ||
+                   (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                   (pool == GGML_OP_POOL_AVG || pool == GGML_OP_POOL_MAX) &&
+                   src0->nb[0] == ggml_type_size(src0->type) && op->nb[0] == sizeof(float);
+        }
+        case GGML_OP_CUMSUM:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        case GGML_OP_TRI:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        case GGML_OP_COUNT_EQUAL:
+            // the count goes into the low word of the i64 result, so it must fit in 32 bits
+            return src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_I64 && ggml_is_scalar(op) &&
+                   ggml_are_same_shape(src0, src1) && ggml_is_contiguous_rows(src0) &&
+                   ggml_is_contiguous_rows(src1) && ggml_nelements(src0) <= UINT32_MAX;
+        case GGML_OP_ADD1:
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_scalar(src1) &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        case GGML_OP_LEAKY_RELU:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        case GGML_OP_SET:
+        case GGML_OP_ACC:
+            // the CPU asserts the same: src0 and dst are contiguous and the same shape
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) && ggml_are_same_shape(src0, op) &&
+                   src1->nb[0] == sizeof(float);
         case GGML_OP_ADD_ID:
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) &&
@@ -2461,6 +3783,185 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                    src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) &&
                    src0->nb[1] == src0->ne[0] * sizeof(float) && src1->nb[1] == src1->ne[0] * sizeof(float) &&
                    ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_OPT_STEP_ADAMW:
+            {
+                // the update is indexed flat, so every operand must be contiguous and the same shape
+                const bool adamw = op->op == GGML_OP_OPT_STEP_ADAMW;
+                const ggml_tensor * p = adamw ? op->src[4] : op->src[2];
+                bool ok = src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                          p && p->type == GGML_TYPE_F32 &&
+                          ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(p) &&
+                          ggml_are_same_shape(src0, src1) &&
+                          ggml_nelements(p) == (adamw ? 7 : 2) && ggml_nelements(src0) <= UINT32_MAX;
+                if (ok && adamw) {
+                    for (int i = 2; i <= 3; i++) {
+                        ok = ok && op->src[i] && op->src[i]->type == GGML_TYPE_F32 &&
+                             ggml_is_contiguous(op->src[i]) && ggml_are_same_shape(src0, op->src[i]);
+                    }
+                }
+                return ok;
+            }
+        case GGML_OP_SILU_BACK:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(src1, op) && ggml_are_same_shape(src1, src0) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_REPEAT_BACK:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   // dst is what repeats up to src0, the same direction the CPU asserts
+                   ggml_can_repeat(op, src0) && ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_RMS_NORM_BACK:
+            // rows are addressed by nb[1..3], so only the rows themselves have to be packed
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   ggml_are_same_shape(src0, op) && ggml_are_same_shape(src0, src1);
+        case GGML_OP_SOFT_MAX_BACK:
+            {
+                // the kernel indexes rows flat, and it has no ALiBi slope
+                float max_bias = 0.0f;
+                memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+                return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                       max_bias == 0.0f &&
+                       ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+                       ggml_are_same_shape(src0, op) && ggml_are_same_shape(src1, op);
+            }
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_scalar(op) &&
+                   ggml_are_same_shape(src0, src1);
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2] && op->src[2]->type == GGML_TYPE_F32 && ggml_is_scalar(src0) &&
+                   ggml_is_contiguous(src1) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(src1, op->src[2]) && ggml_are_same_shape(src1, op);
+        case GGML_OP_IM2COL_BACK:
+            // src1 is only read for its shape, so its type does not matter here
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
+                   ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 1) > 0 &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_GET_ROWS_BACK:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op) && src0->nb[0] == sizeof(float) &&
+                   src0->ne[0] == op->ne[0] && ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_DSV4_HC_PRE:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->ne[0] == src0->ne[0] && op->ne[1] == src0->ne[2] &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_DSV4_HC_POST:
+            {
+                const ggml_tensor * p = op->src[2];
+                const ggml_tensor * c = op->src[3];
+                return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                       p->type == GGML_TYPE_F32 && (!c || c->type == GGML_TYPE_F32) &&
+                       op->ne[0] == src0->ne[0] && op->ne[1] == src1->ne[1] && op->ne[2] == src0->ne[1] &&
+                       ggml_nelements(op) <= UINT32_MAX;
+            }
+        case GGML_OP_DSV4_HC_COMB:
+            // the kernel fixes hc at 4, exactly as the CPU reference does
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->ne[0] == 4 && op->ne[1] == 4 &&
+                   op->ne[2] == src0->ne[1] && src1->ne[0] >= 3 && ggml_get_op_params_i32(op, 1) > 0 &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                // the mask is f16 whatever K is, so this op always needs 16 bit loads
+                const ggml_tensor * w = op->src[2];
+                const ggml_tensor * m = op->src[3];
+                return ctx->caps.native_16bit && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                       (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+                       w->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F16 &&
+                       op->nb[0] == sizeof(float) && src0->nb[0] == sizeof(float) &&
+                       src1->nb[0] == ggml_type_size(src1->type) && w->nb[0] == sizeof(float) &&
+                       m->nb[0] == sizeof(ggml_fp16_t) &&
+                       op->ne[0] == src1->ne[2] && op->ne[1] == src0->ne[2] && op->ne[2] == 1 &&
+                       op->ne[3] == src0->ne[3] && m->ne[3] > 0 &&
+                       ggml_nelements(op) <= UINT32_MAX;
+            }
+        case GGML_OP_RWKV_WKV6:
+        case GGML_OP_GATED_LINEAR_ATTN:
+        case GGML_OP_RWKV_WKV7:
+            {
+                // every tensor is indexed flat, exactly as the CPU kernels do
+                const int n_src  = op->op == GGML_OP_RWKV_WKV7 ? 7 : (op->op == GGML_OP_RWKV_WKV6 ? 6 : 5);
+                const ggml_tensor * state = op->src[n_src - 1];
+                const int64_t T      = op->src[1]->ne[2];
+                const int64_t heads  = op->src[1]->ne[1];
+                const int64_t n_seqs = state->ne[1];
+                bool ok = op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+                for (int i = 0; i < n_src; i++) {
+                    ok = ok && op->src[i] && op->src[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[i]);
+                }
+                ok = ok && heads > 0 && n_seqs > 0 && op->ne[0] % heads == 0 && T % n_seqs == 0 &&
+                     ggml_nelements(op) <= UINT32_MAX;
+                return ok;
+            }
+        case GGML_OP_CONV_2D:
+            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                   ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   src0->ne[2] == src1->ne[2] && ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_CONV_3D:
+            {
+                // C and OC come from op_params rather than a shape, so check them against the tensors
+                const int32_t c_in  = ggml_get_op_params_i32(op, 9);
+                const int32_t c_out = ggml_get_op_params_i32(op, 11);
+                return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                       (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                       ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                       c_in > 0 && c_out > 0 && src0->ne[3] == (int64_t) c_in * c_out &&
+                       src1->ne[3] % c_in == 0 && op->ne[3] % c_out == 0 &&
+                       ggml_nelements(op) <= UINT32_MAX;
+            }
+        case GGML_OP_CONV_TRANSPOSE_2D:
+            // Cin is walked across both inputs, so the kernel's ne[3] must match src1's ne[2]
+            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                   src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) &&
+                   op->nb[0] == sizeof(float) && src0->ne[3] == src1->ne[2] &&
+                   ggml_get_op_params_i32(op, 0) > 0 && ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_COL2IM_1D:
+            // f32 only; the CPU also takes f16 and bf16 columns
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
+                   ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 0) > 0 &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_CONV_TRANSPOSE_1D:
+            // the gather walks Cin across both inputs, so the kernel's Cin count must match src1's rows
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   src0->ne[2] == src1->ne[1] && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_CONV_2D_DW:
+            // only the WHCN path; the CWHN variant the CPU also handles has a different kernel layout
+            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_SSM_SCAN:
+            {
+                // one thread per (sequence, head, dim); the rows it indexes directly must be packed
+                const ggml_tensor * dt  = op->src[2];
+                const ggml_tensor * A   = op->src[3];
+                const ggml_tensor * B   = op->src[4];
+                const ggml_tensor * C   = op->src[5];
+                const ggml_tensor * ids = op->src[6];
+                const int64_t nc = src0->ne[0];
+                const int64_t nr = src0->ne[1];
+                const int64_t nh = src1->ne[1];
+                const int64_t ng = B->ne[1];
+                bool ok = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                          dt->type == GGML_TYPE_F32 && A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32 &&
+                          C->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32;
+                ok = ok && ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dt->nb[0] == sizeof(float) &&
+                     src1->nb[1] == nr * sizeof(float) && A->nb[1] == A->ne[0] * sizeof(float) &&
+                     B->nb[1] == nc * sizeof(float) && C->nb[1] == nc * sizeof(float);
+                // every stride is passed in float units, and the flat job index is 32 bit
+                ok = ok && ng != 0 && nh % ng == 0 && ggml_nelements(op) <= UINT32_MAX;
+                return ok;
+            }
         case GGML_OP_CONCAT:
             return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32) && src0->type == op->type &&
                    src1->type == op->type && ggml_nelements(op) <= UINT32_MAX;
@@ -2484,6 +3985,9 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                        (!s || s->type == GGML_TYPE_F32) && ggml_is_contiguous(op);
             }
         case GGML_OP_ROPE:
+        // ROPE_BACK is the same rotation with the sine negated, and DeepSeek-V4-Flash uses it in its
+        // forward graph, so it is not a training-only op
+        case GGML_OP_ROPE_BACK:
             return (op->type == GGML_TYPE_F32 || (op->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
                    src0->type == op->type && src1->type == GGML_TYPE_I32 && src0->ne[0] % 2 == 0 &&
                    (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
@@ -2673,6 +4177,9 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
     hr = dev.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, dev.allocator.get(), nullptr, IID_PPV_ARGS(dev.cmd_list.put()));
     if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: CreateCommandList failed 0x%08lx\n", (unsigned long) hr); return false; }
     dev.cmd_list->Close();
+    // the names come back in the DRED breadcrumbs
+    dev.queue->SetName(L"ggml_d3d12_queue");
+    dev.cmd_list->SetName(L"ggml_d3d12_list");
     hr = dev.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(dev.fence.put()));
     if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: CreateFence failed 0x%08lx\n", (unsigned long) hr); return false; }
     dev.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -2793,6 +4300,19 @@ static void ggml_d3d12_enumerate(ggml_backend_d3d12_reg_context & reg_ctx, ggml_
     }
     const bool allow_warp = getenv("GGML_D3D12_WARP") != nullptr;
 
+    // DRED has to be turned on before the device is created, and it is per process, not per device
+    const bool dred_on = getenv("GGML_D3D12_DRED") != nullptr;
+    if (dred_on) {
+        com_ptr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(dred.put())))) {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            GGML_LOG_INFO("ggml_d3d12: DRED enabled\n");
+        } else {
+            GGML_LOG_WARN("ggml_d3d12: DRED requested but unavailable\n");
+        }
+    }
+
     com_ptr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory2(factory_flags, IID_PPV_ARGS(factory.put())))) {
         GGML_LOG_WARN("ggml_d3d12: CreateDXGIFactory2 failed\n");
@@ -2832,6 +4352,7 @@ static void ggml_d3d12_enumerate(ggml_backend_d3d12_reg_context & reg_ctx, ggml_
             continue;
         }
         dev->adapter       = adapter;
+        dev->dred          = dred_on;
         dev->desc          = ggml_d3d12_wide_to_utf8(desc.Description);
         dev->dedicated_mem = desc.DedicatedVideoMemory;
         dev->shared_mem    = desc.SharedSystemMemory;
