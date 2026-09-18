@@ -3500,7 +3500,11 @@ static void ggml_backend_d3d12_device_get_memory(ggml_backend_dev_t dev, size_t 
     com_ptr<IDXGIAdapter3> adapter3;
     if (SUCCEEDED(ctx->adapter->QueryInterface(IID_PPV_ARGS(adapter3.put())))) {
         DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
-        const DXGI_MEMORY_SEGMENT_GROUP group = ctx->caps.uma ? DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL : DXGI_MEMORY_SEGMENT_GROUP_LOCAL;
+        // LOCAL is the segment that carries the budget on both kinds of adapter: dedicated VRAM on a
+        // discrete card, and the share of system memory the driver grants on a UMA one. NON_LOCAL is
+        // the system-memory fallback of a discrete card and reads back as a zero budget on UMA, which
+        // made an integrated GPU report no free memory at all.
+        const DXGI_MEMORY_SEGMENT_GROUP group = DXGI_MEMORY_SEGMENT_GROUP_LOCAL;
         if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, group, &info))) {
             *free = info.Budget > info.CurrentUsage ? (size_t) (info.Budget - info.CurrentUsage) : 0;
             if (info.Budget > 0) {

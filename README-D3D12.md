@@ -222,7 +222,7 @@ but it is slower than it should be. `GGML_D3D12_STATS=1` lists exactly which ope
 ## 8. If something goes wrong
 
 **"The code execution cannot proceed because dxcompiler.dll was not found"**
-You moved the exe out of the folder. All five files have to stay together.
+You moved the exe out of the folder. All six files have to stay together.
 
 **No device listed by `--list-devices`**
 Update your graphics driver. If it still shows nothing, your GPU or driver does not do D3D12
